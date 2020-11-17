@@ -56,7 +56,9 @@ struct Opts {
 
 #[derive(Clap, Debug)]
 enum SubCommand {
+    /// When run, Slack will be queries and add it's results into Redis
     UpdateRedis(UpdateRedisArgs),
+    /// Web server that serves results from `update-redis` sub-command
     Web(WebArgs),
 }
 
