@@ -21,9 +21,9 @@ jobs:
     - name: push to registry
       run: |
         VERSION=$(docker run --rm -v $(pwd):/target docker.pkg.github.com/ethankhall/crom/cli:latest get current-version --no-snapshot | sed 's/v//g')
-        docker tag slack-user-cache docker.pkg.github.com/ethankhall/slack-user-cache/proxy:$(git rev-parse --short HEAD)
-        docker tag slack-user-cache docker.pkg.github.com/ethankhall/slack-user-cache/proxy:$VERSION
-        docker tag slack-user-cache docker.pkg.github.com/ethankhall/slack-user-cache/proxy:latest
-        docker push docker.pkg.github.com/ethankhall/slack-user-cache/proxy:$(git rev-parse --short HEAD)
-        docker push docker.pkg.github.com/ethankhall/slack-user-cache/proxy:$VERSION
-        docker push docker.pkg.github.com/ethankhall/slack-user-cache/proxy:latest
+        docker tag slack-user-cache docker.pkg.github.com/ethankhall/slack-user-cache/slack-user-cache:$(git rev-parse --short HEAD)
+        docker tag slack-user-cache docker.pkg.github.com/ethankhall/slack-user-cache/slack-user-cache:$VERSION
+        docker tag slack-user-cache docker.pkg.github.com/ethankhall/slack-user-cache/slack-user-cache:latest
+        docker push docker.pkg.github.com/ethankhall/slack-user-cache/slack-user-cache:$(git rev-parse --short HEAD)
+        docker push docker.pkg.github.com/ethankhall/slack-user-cache/slack-user-cache:$VERSION
+        docker push docker.pkg.github.com/ethankhall/slack-user-cache/slack-user-cache:latest
