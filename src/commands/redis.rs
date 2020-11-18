@@ -33,19 +33,22 @@ pub async fn redis_update(
         None => return Err(CliErrors::Slack(SlackErrors::UnableToFetch)),
         Some(users) => users,
     };
-
     info!("Fetched {} users to save into redis", slack_users.len());
+    
+    debug!("Saving Users to Redis");
+    redis_server.insert_users(&slack_users).await?;
+    info!("{} users saved", slack_users.len());
 
     debug!("Getting user groups");
     let slack_user_groups = match slack_api.list_all_user_groups().await {
         None => return Err(CliErrors::Slack(SlackErrors::UnableToFetch)),
         Some(users) => users,
     };
+    info!("Fetched {} user groups to save into redis", slack_user_groups.len());
 
-    debug!("Saving Users to Redis");
-    redis_server.insert_users(slack_users).await?;
     debug!("Saving User Groups to Redis");
-    redis_server.insert_user_groups(slack_user_groups).await?;
+    redis_server.insert_user_groups(&slack_user_groups).await?;
+    info!("{} user groups saved", slack_user_groups.len());
 
     Ok(())
 }

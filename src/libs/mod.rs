@@ -1,5 +1,5 @@
 pub mod redis;
 pub mod slack;
 
-pub use redis::{RedisServer, RedisResponse};
+pub use redis::{RedisResponse, RedisServer};
 pub use slack::{SlackApi, SlackUser, SlackUserGroup};

@@ -37,7 +37,7 @@ impl LoggingOpts {
             }
         } else {
             LoggingOpts {
-                debug: true,
+                debug: false,
                 error: right.error || left.error,
                 verbose: 0,
             }
@@ -70,8 +70,8 @@ pub struct UpdateRedisArgs {
     /// Unique ID to identify the server
     #[clap(long, env = "SERVER_ID")]
     pub server_id: String,
-    
-    /// Slack API token. Permissions required: usergroups:read, users.profile:read, users:read
+
+    /// Slack API token. Permissions required: usergroups:read, users.profile:read, users:read, users:read.email
     #[clap(long, env = "SLACK_BOT_TOKEN")]
     pub slack_token: String,
 
@@ -88,14 +88,14 @@ pub struct UpdateRedisArgs {
 pub struct WebArgs {
     #[clap(flatten)]
     pub logging_opts: LoggingOpts,
-    
+
     /// Address of the Redis Server
     #[clap(long, default_value = "redis://127.0.0.1/", env = "REDIS_ADDRESS")]
     pub redis_address: String,
-    
+
     /// Where the Server should listen on
     #[clap(long, default_value = "0.0.0.0:3000", env = "LISTEN_ADDRESS")]
-    pub listen_server: String
+    pub listen_server: String,
 }
 
 #[tokio::main]

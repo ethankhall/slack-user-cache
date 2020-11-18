@@ -37,7 +37,7 @@ enum RedisResult {
 pub enum RedisResponse<T, E> {
     Err(E),
     Missing,
-    Ok(T)
+    Ok(T),
 }
 
 impl RedisServer {
@@ -82,24 +82,25 @@ impl RedisServer {
     }
 
     async fn unwrap_object<T>(&self, query_string: &str) -> RedisResponse<T, RedisErrors>
-    where T: serde::de::DeserializeOwned + Clone {
+    where
+        T: serde::de::DeserializeOwned + Clone,
+    {
         match self.get_str(query_string).await {
             Err(e) => RedisResponse::Err(e),
             Ok(res) => match res {
-                RedisResult::String(s) => {
-                    match serde_json::from_str(&s) {
-                        Ok(value) => RedisResponse::Ok(value),
-                        Err(e) => RedisResponse::Err(RedisErrors::UnableToDeserialize(format!("{}", e)))
-                    }
+                RedisResult::String(s) => match serde_json::from_str(&s) {
+                    Ok(value) => RedisResponse::Ok(value),
+                    Err(e) => RedisResponse::Err(RedisErrors::UnableToDeserialize(format!(
+                        "Input: `{}`. Error: {}",
+                        &s, e
+                    ))),
                 },
-                RedisResult::Nil => {
-                    RedisResponse::Missing
-                }
-            }
+                RedisResult::Nil => RedisResponse::Missing,
+            },
         }
     }
 
-    pub async fn insert_users(&self, slack_users: BTreeSet<SlackUser>) -> Result<()> {
+    pub async fn insert_users(&self, slack_users: &BTreeSet<SlackUser>) -> Result<()> {
         for user in slack_users {
             if let Err(e) = self
                 .set_str(
@@ -127,7 +128,7 @@ impl RedisServer {
         Ok(())
     }
 
-    pub async fn insert_user_groups(&self, slack_users: BTreeSet<SlackUserGroup>) -> Result<()> {
+    pub async fn insert_user_groups(&self, slack_users: &BTreeSet<SlackUserGroup>) -> Result<()> {
         for group in slack_users {
             if let Err(e) = self
                 .set_str(
@@ -216,18 +217,56 @@ impl RedisServer {
             .await
             .map_err(|e| RedisErrors::UnableToGet(format!("{}", e)))?;
 
-        trace!("SCAN `{:?}", pattern);
+        trace!("SCAN `{}", pattern);
 
-        let mut results: Vec<_> = Vec::new();
+        let mut keys: BTreeSet<String> = BTreeSet::new();
 
         while let Some(element) = iter.next_item().await {
             if redis::Value::Nil == element {
                 continue;
             }
 
-            let value = match String::from_redis_value(&element) {
+            match String::from_redis_value(&element) {
                 Err(e) => {
-                    warn!("Unable to deserialize object: {}", e);
+                    warn!("Unable to deserialize redis object: {}", e);
+                    continue;
+                }
+                Ok(v) => {
+                    keys.insert(v);
+                }
+            };
+        }
+
+        trace!("Number of elements to search over: {}", keys.len());
+
+        if keys.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let mut results: Vec<_> = Vec::new();
+        let values = con
+            .get(keys)
+            .await
+            .map_err(|e| RedisErrors::UnableToGet(format!("{}", e)))?;
+
+        let values = match values {
+            redis::Value::Bulk(v) => v,
+            _ => {
+                warn!("Unable to fetch array");
+                return Err(RedisErrors::UnableToGet(format!(
+                    "Unable to fetch data from redis"
+                )));
+            }
+        };
+
+        for value in values {
+            if redis::Value::Nil == value {
+                continue;
+            }
+
+            let value = match String::from_redis_value(&value) {
+                Err(e) => {
+                    warn!("Unable to deserialize redis object: {}", e);
                     continue;
                 }
                 Ok(v) => v,
@@ -238,7 +277,7 @@ impl RedisServer {
                     results.push(res);
                 }
                 Err(e) => {
-                    warn!("Unable to deserialize. Error: {}", e);
+                    warn!("Unable to parse object. Input {}. Error: {}", &value, e);
                     continue;
                 }
             }

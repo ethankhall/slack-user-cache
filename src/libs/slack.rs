@@ -2,7 +2,7 @@ use std::cmp::{Ord, Ordering};
 use std::collections::BTreeSet;
 use std::iter::FromIterator;
 
-use log::{error, info, trace, warn};
+use log::{error, info, trace, debug, warn};
 use serde::{Deserialize, Serialize};
 
 use reqwest::Client;
@@ -77,50 +77,82 @@ impl SlackApi {
     }
 
     pub async fn list_all_users(&self) -> Option<BTreeSet<SlackUser>> {
-        use slack_api::users::ListRequest;
+        use governor::{Jitter, Quota, RateLimiter};
+        use models::ListRequest;
+        use nonzero_ext::*;
+        use std::time::Duration;
+
         info!("Fetching all users from Slack");
 
-        let all_users = match slack_api::users::list(
-            &self.client,
-            &self.token,
-            &ListRequest { presence: None },
-        )
-        .await
-        {
-            Ok(results) => results,
-            Err(e) => {
-                error!("Unable to fetch data from Slack. Error: {}", e);
-                return None;
-            }
-        };
+        let mut cursor = None;
+        let mut all_users = BTreeSet::new();
+        let lim = RateLimiter::direct(Quota::per_minute(nonzero!(10u32)));
+        let mut page_number = 0;
 
-        let all_users = match all_users.members {
-            Some(users) => users,
-            None => {
-                warn!("Slack responded with no responses.");
-                return None;
-            }
-        };
+        loop {
+            lim.until_ready_with_jitter(Jitter::up_to(Duration::from_secs(1)))
+                .await;
 
-        let all_users: Vec<SlackUser> = all_users
-            .into_iter()
-            .filter(|user| user.deleted == Some(false))
-            .filter(|user| user.is_bot == Some(false))
-            .map(|user| {
-                trace!("Raw User Data: {:?}", user);
-                SlackUser::new(user)
-            })
-            .filter_map(|res| {
-                if let Err(e) = res {
-                    warn!("Unable to process user. Error: {}", e);
+            info!("Fetching page number {}", page_number);
+
+            let paged_users = match models::list(
+                &self.client,
+                &self.token,
+                &ListRequest {
+                    limit: Some(200),
+                    cursor: cursor,
+                },
+            )
+            .await
+            {
+                Ok(results) => results,
+                Err(e) => {
+                    error!("Unable to fetch data from Slack. Error: {}", e);
                     return None;
                 }
-                return Some(res);
-            })
-            .map(|user| user.unwrap())
-            .collect();
+            };
 
-        Some(BTreeSet::from_iter(all_users.into_iter()))
+            debug!("response_metadata: {:?}", paged_users.response_metadata);
+            cursor = paged_users.response_metadata.next_cursor;
+
+            let paged_users = match paged_users.members {
+                Some(users) => users,
+                None => {
+                    warn!("Slack responded with no responses.");
+                    return None;
+                }
+            };
+
+            let paged_users: Vec<SlackUser> = paged_users
+                .into_iter()
+                .filter(|user| user.deleted == Some(false))
+                .filter(|user| user.is_bot == Some(false))
+                .map(|user| {
+                    trace!("Raw User Data: {:?}", user);
+                    SlackUser::new(user)
+                })
+                .filter_map(|res| {
+                    if let Err(e) = res {
+                        warn!("Unable to process user. Error: {}", e);
+                        return None;
+                    }
+                    return Some(res);
+                })
+                .map(|user| user.unwrap())
+                .collect();
+            
+            info!("Fetched {} users from page {}", paged_users.len(), page_number);
+            
+            all_users.extend(paged_users.into_iter());
+
+            page_number = page_number + 1;
+
+            if cursor == None || cursor == Some("".to_owned()) {
+                break;
+            }
+        }
+
+        Some(all_users)
     }
 
     pub async fn list_all_user_groups(&self) -> Option<BTreeSet<SlackUserGroup>> {
@@ -208,5 +240,85 @@ impl SlackApi {
             name,
             users: user_set,
         })
+    }
+}
+
+mod models {
+    use serde::Deserialize;
+    use slack_api::requests::SlackWebRequestSender;
+    use slack_api::users::ListError;
+    use slack_api::User;
+    use std::error::Error;
+
+    #[derive(Clone, Default, Debug)]
+    pub struct ListRequest {
+        /// Paginate through collections of data by setting
+        pub cursor: Option<String>,
+        /// Paginate through collections of data by setting
+        pub limit: Option<u16>,
+    }
+
+    #[derive(Clone, Debug, Deserialize)]
+    pub struct ResponseMetadata {
+        pub next_cursor: Option<String>,
+    }
+
+    #[derive(Clone, Debug, Deserialize)]
+    pub struct ListResponse {
+        error: Option<String>,
+        pub members: Option<Vec<User>>,
+        #[serde(default)]
+        ok: bool,
+        pub response_metadata: ResponseMetadata,
+    }
+
+    impl<E: Error> Into<Result<ListResponse, ListError<E>>> for ListResponse {
+        fn into(self) -> Result<ListResponse, ListError<E>> {
+            if self.ok {
+                Ok(self)
+            } else {
+                Err(self.error.as_ref().map(String::as_ref).unwrap_or("").into())
+            }
+        }
+    }
+
+    /// Lists all users in a Slack team.
+    ///
+    /// Wraps https://api.slack.com/methods/users.list
+
+    pub async fn list<R>(
+        client: &R,
+        token: &str,
+        request: &ListRequest,
+    ) -> Result<ListResponse, ListError<R::Error>>
+    where
+        R: SlackWebRequestSender,
+    {
+        let params = vec![
+            Some(("token", token.to_owned())),
+            request
+                .cursor
+                .as_ref()
+                .map(|cursor| ("cursor", cursor.clone())),
+            request
+                .limit
+                .as_ref()
+                .map(|limit| ("limit", limit.to_string())),
+        ];
+        let params = params.into_iter().filter_map(|x| x).collect::<Vec<_>>();
+        let url = get_slack_url_for_method("users.list");
+        client
+            .send(&url, &params[..])
+            .await
+            .map_err(ListError::Client)
+            .and_then(|result| {
+                serde_json::from_str::<ListResponse>(&result)
+                    .map_err(|e| ListError::MalformedResponse(result, e))
+            })
+            .and_then(|o| o.into())
+    }
+
+    fn get_slack_url_for_method(method: &str) -> String {
+        format!("https://slack.com/api/{}", method)
     }
 }
