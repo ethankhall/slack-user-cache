@@ -1,9 +1,10 @@
-FROM rust:1.47 as builder
+FROM rust:1.51 as builder
 
 RUN USER=root cargo new --bin slack-user-cache
 WORKDIR /slack-user-cache
 COPY ./Cargo.toml ./Cargo.toml
 COPY ./Cargo.lock ./Cargo.lock
+COPY ./rust-toolchain ./rust-toolchain
 RUN cargo build --release
 RUN rm src/*.rs
 
