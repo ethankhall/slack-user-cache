@@ -7,7 +7,7 @@ on:
 
 jobs:
   runs-on: ubuntu-latest
-    steps:
+  steps:
     - uses: actions/checkout@v1
     - name: login to registry
       run: docker login docker.pkg.github.com --username ethankhall --password ${{ secrets.GITHUB_TOKEN }}
