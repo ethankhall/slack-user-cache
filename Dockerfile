@@ -20,7 +20,7 @@ FROM debian:buster-slim
 ARG APP=/app
 
 RUN apt-get update \
-    && apt-get install -y tzdata \
+    && apt-get install -y tzdata openssl ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
 EXPOSE 3000

@@ -8,7 +8,7 @@ edition = "2018"
 
 [dependencies]
 slack_api = { version = "0.23", features = ["async"], default-features = false }
-reqwest = "0.11"
+reqwest = { version = "0.11", features = ["rustls-tls"] }
 tracing = "0.1"
 tracing-subscriber = "0.2.0"
 clap = { git = "https://github.com/clap-rs/clap/", tag = "v3.0.0-beta.2" }
