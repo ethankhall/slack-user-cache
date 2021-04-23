@@ -1,0 +1,24 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: slack-user-cache
+  labels:
+    app: slack-user-cache
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: slack-user-cache
+  template:
+    metadata:
+      labels:
+        app: slack-user-cache
+    spec:
+      containers:
+      - name: cache
+        image: slack-user-cache:latest
+        ports:
+        - containerPort: 3000
+        env:
+          - name: REDIS_ADDRESS
+            value: redis://127.0.0.1/

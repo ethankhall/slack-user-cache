@@ -1,27 +1,22 @@
-use log::{debug, info, warn};
+use tracing::{debug, info, warn};
 
 use crate::error::{CliErrors, SlackErrors};
-use crate::{init_logger, LoggingOpts, UpdateRedisArgs};
+use crate::UpdateRedisArgs;
 
 use crate::libs::{RedisServer, SlackApi};
 
-pub async fn redis_update(
-    root_logger: &LoggingOpts,
-    args: &UpdateRedisArgs,
-) -> Result<(), CliErrors> {
-    init_logger(&LoggingOpts::merge(&root_logger, &args.logging_opts));
-
+pub async fn redis_update(args: &UpdateRedisArgs) -> Result<(), CliErrors> {
     let redis_server = match RedisServer::new(&args.redis_address).await {
         Ok(redis_server) => redis_server,
         Err(e) => return Err(CliErrors::Redis(e)),
     };
 
     debug!("Getting server lock");
-    let lock_owner = redis_server.acquire_lock(&args.server_id).await?;
+    let has_lock = redis_server.acquire_lock(&args.server_id).await?;
     if args.ignore_lock {
         warn!("Ignoring existing lock (if it exists). Be careful!");
-    } else if lock_owner != args.server_id {
-        info!("Another server `{}` has the lock. Giving up", lock_owner);
+    } else if has_lock {
+        info!("Another server has the lock. Giving up");
         return Ok(());
     }
     debug!("Server lock acquired");
@@ -34,7 +29,7 @@ pub async fn redis_update(
         Some(users) => users,
     };
     info!("Fetched {} users to save into redis", slack_users.len());
-    
+
     debug!("Saving Users to Redis");
     redis_server.insert_users(&slack_users).await?;
     info!("{} users saved", slack_users.len());
@@ -44,7 +39,10 @@ pub async fn redis_update(
         None => return Err(CliErrors::Slack(SlackErrors::UnableToFetch)),
         Some(users) => users,
     };
-    info!("Fetched {} user groups to save into redis", slack_user_groups.len());
+    info!(
+        "Fetched {} user groups to save into redis",
+        slack_user_groups.len()
+    );
 
     debug!("Saving User Groups to Redis");
     redis_server.insert_user_groups(&slack_user_groups).await?;

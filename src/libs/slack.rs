@@ -1,24 +1,63 @@
 use std::cmp::{Ord, Ordering};
 use std::collections::BTreeSet;
-use std::iter::FromIterator;
 
-use log::{error, info, trace, debug, warn};
+use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use tracing::{debug, error, info, trace, warn};
 
 use reqwest::Client;
-use slack_api;
+use slack_api::requests::SlackWebRequestSender;
 use slack_api::{User, Usergroup};
 
 #[derive(Debug)]
-pub struct SlackApi {
+struct SlackClient {
     client: Client,
+}
+
+impl Default for SlackClient {
+    fn default() -> Self {
+        Self {
+            client: reqwest::Client::new(),
+        }
+    }
+}
+
+#[async_trait]
+impl SlackWebRequestSender for SlackClient {
+    type Error = reqwest::Error;
+
+    async fn send<I, K, V, S>(&self, method_url: S, params: I) -> Result<String, Self::Error>
+    where
+        I: IntoIterator + Send,
+        K: AsRef<str>,
+        V: AsRef<str>,
+        I::Item: std::borrow::Borrow<(K, V)>,
+        S: AsRef<str> + Send,
+    {
+        let mut url = reqwest::Url::parse(method_url.as_ref()).expect("Unable to parse url");
+
+        url.query_pairs_mut().extend_pairs(params);
+
+        Ok(self.client.get(url).send().await?.text().await?)
+    }
+}
+
+#[derive(Debug)]
+pub struct SlackApi {
+    client: SlackClient,
     token: String,
 }
 
 #[serde(rename_all = "kebab-case")]
-#[derive(Debug, Eq, PartialEq, PartialOrd, Serialize, Deserialize, Clone)]
+#[derive(Debug, Eq, PartialEq, Serialize, Deserialize, Clone)]
 pub struct SlackUserId {
     id: String,
+}
+
+impl PartialOrd for SlackUserId {
+    fn partial_cmp(&self, other: &SlackUserId) -> Option<Ordering> {
+       Some(self.cmp(other))
+    }
 }
 
 impl Ord for SlackUserId {
@@ -28,11 +67,23 @@ impl Ord for SlackUserId {
 }
 
 #[serde(rename_all = "kebab-case")]
-#[derive(Debug, Eq, PartialEq, PartialOrd, Serialize, Deserialize, Clone)]
+#[derive(Debug, Eq, PartialEq, Serialize, Deserialize, Clone)]
 pub struct SlackUser {
     pub id: String,
     pub name: String,
     pub email: String,
+}
+
+impl PartialOrd for SlackUser {
+    fn partial_cmp(&self, other: &SlackUser) -> Option<Ordering> {
+       Some(self.cmp(other))
+    }
+}
+
+impl Ord for SlackUser {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.id.cmp(&other.id)
+    }
 }
 
 impl SlackUser {
@@ -48,18 +99,18 @@ impl SlackUser {
     }
 }
 
-impl Ord for SlackUser {
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.id.cmp(&other.id)
-    }
-}
-
 #[serde(rename_all = "kebab-case")]
-#[derive(Debug, Eq, PartialEq, PartialOrd, Serialize, Deserialize, Clone)]
+#[derive(Debug, Eq, PartialEq, Serialize, Deserialize, Clone)]
 pub struct SlackUserGroup {
     pub name: String,
     pub id: String,
     pub users: BTreeSet<SlackUserId>,
+}
+
+impl PartialOrd for SlackUserGroup {
+    fn partial_cmp(&self, other: &SlackUserGroup) -> Option<Ordering> {
+       Some(self.cmp(other))
+    }
 }
 
 impl Ord for SlackUserGroup {
@@ -72,7 +123,7 @@ impl SlackApi {
     pub fn new(token: &str) -> Self {
         Self {
             token: token.to_owned(),
-            client: reqwest::Client::new(),
+            client: SlackClient::default(),
         }
     }
 
@@ -87,7 +138,7 @@ impl SlackApi {
         let mut cursor = None;
         let mut all_users = BTreeSet::new();
         let lim = RateLimiter::direct(Quota::per_minute(nonzero!(10u32)));
-        let mut page_number = 0;
+        let mut page_number: u32 = 0;
 
         loop {
             lim.until_ready_with_jitter(Jitter::up_to(Duration::from_secs(1)))
@@ -100,7 +151,7 @@ impl SlackApi {
                 &self.token,
                 &ListRequest {
                     limit: Some(200),
-                    cursor: cursor,
+                    cursor,
                 },
             )
             .await
@@ -131,21 +182,19 @@ impl SlackApi {
                     trace!("Raw User Data: {:?}", user);
                     SlackUser::new(user)
                 })
-                .filter_map(|res| {
-                    if let Err(e) = res {
-                        warn!("Unable to process user. Error: {}", e);
-                        return None;
-                    }
-                    return Some(res);
-                })
+                .filter(|res| { res.is_ok() })
                 .map(|user| user.unwrap())
                 .collect();
-            
-            info!("Fetched {} users from page {}", paged_users.len(), page_number);
-            
+
+            info!(
+                "Fetched {} users from page {}",
+                paged_users.len(),
+                page_number
+            );
+
             all_users.extend(paged_users.into_iter());
 
-            page_number = page_number + 1;
+            page_number += 1;
 
             if cursor == None || cursor == Some("".to_owned()) {
                 break;
@@ -228,12 +277,11 @@ impl SlackApi {
             }
         };
 
-        let user_set = BTreeSet::from_iter(
-            users
+        let user_set:BTreeSet<SlackUserId> = users
                 .into_iter()
                 .flatten()
-                .map(|user_id| SlackUserId { id: user_id }),
-        );
+                .map(|user_id| SlackUserId { id: user_id })
+                .collect();
 
         Ok(SlackUserGroup {
             id: id.to_string(),
@@ -272,12 +320,12 @@ mod models {
         pub response_metadata: ResponseMetadata,
     }
 
-    impl<E: Error> Into<Result<ListResponse, ListError<E>>> for ListResponse {
-        fn into(self) -> Result<ListResponse, ListError<E>> {
-            if self.ok {
-                Ok(self)
+    impl<E: Error> From<ListResponse> for Result<ListResponse, ListError<E>> {
+        fn from(resp: ListResponse) -> Result<ListResponse, ListError<E>> {
+            if resp.ok {
+                Ok(resp)
             } else {
-                Err(self.error.as_ref().map(String::as_ref).unwrap_or("").into())
+                Err(resp.error.as_ref().map(String::as_ref).unwrap_or("").into())
             }
         }
     }

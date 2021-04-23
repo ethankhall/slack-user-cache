@@ -1,10 +1,11 @@
-use log::{debug, trace, warn};
+use tracing::{trace, warn};
 
 use super::slack::{SlackUser, SlackUserGroup};
 use crate::error::RedisErrors;
 use std::collections::BTreeSet;
 use std::time::Duration;
 
+use anyhow::anyhow;
 use derivative::Derivative;
 use mobc::{Connection, Pool};
 use mobc_redis::redis::{AsyncCommands, FromRedisValue};
@@ -18,13 +19,16 @@ const CACHE_POOL_MAX_OPEN: u64 = 16;
 const CACHE_POOL_MAX_IDLE: u64 = 8;
 const CACHE_POOL_TIMEOUT_SECONDS: u64 = 1;
 const CACHE_POOL_EXPIRE_SECONDS: u64 = 60;
-const REDIS_ENTITY_TIMEOUT_1_HOUR: usize = 60 * 60;
+const REDIS_ENTITY_TIMEOUT: usize = 12 * 60 * 60;
+const REDIS_LOCK_TIMEOUT: usize = 2 * 60;
+const WRITE_LOCK_KEY: &str = "write_lock";
 
 #[derive(Derivative)]
 #[derivative(Debug)]
 pub struct RedisServer {
     #[derivative(Debug = "ignore")]
     redis_client: MobcPool,
+    redis_address: String,
 }
 
 #[derive(Debug, Eq, PartialEq, PartialOrd)]
@@ -42,8 +46,11 @@ pub enum RedisResponse<T, E> {
 
 impl RedisServer {
     pub async fn new(redis_address: &str) -> Result<Self> {
-        let client: redis::Client = redis::Client::open(redis_address)
-            .map_err(|e| RedisErrors::UnableToConnect(format!("{} - {}", e, redis_address)))?;
+        let client: redis::Client =
+            redis::Client::open(redis_address).map_err(|e| RedisErrors::UnableToConnect {
+                address: redis_address.to_owned(),
+                source: anyhow!(e),
+            })?;
         let manager = RedisConnectionManager::new(client);
         let pool = Pool::builder()
             .get_timeout(Some(Duration::from_secs(CACHE_POOL_TIMEOUT_SECONDS)))
@@ -52,7 +59,10 @@ impl RedisServer {
             .max_lifetime(Some(Duration::from_secs(CACHE_POOL_EXPIRE_SECONDS)))
             .build(manager);
 
-        Ok(Self { redis_client: pool })
+        Ok(Self {
+            redis_client: pool,
+            redis_address: redis_address.to_owned(),
+        })
     }
 
     pub async fn get_all_users(&self) -> RedisResponse<Vec<SlackUser>, RedisErrors> {
@@ -90,10 +100,10 @@ impl RedisServer {
             Ok(res) => match res {
                 RedisResult::String(s) => match serde_json::from_str(&s) {
                     Ok(value) => RedisResponse::Ok(value),
-                    Err(e) => RedisResponse::Err(RedisErrors::UnableToDeserialize(format!(
-                        "Input: `{}`. Error: {}",
-                        &s, e
-                    ))),
+                    Err(e) => RedisResponse::Err(RedisErrors::UnableToDeserialize {
+                        input: s,
+                        source: anyhow!(e),
+                    }),
                 },
                 RedisResult::Nil => RedisResponse::Missing,
             },
@@ -106,7 +116,7 @@ impl RedisServer {
                 .set_str(
                     &format!("user:email:{}", user.email),
                     &serde_json::to_string(&user).unwrap(),
-                    REDIS_ENTITY_TIMEOUT_1_HOUR,
+                    REDIS_ENTITY_TIMEOUT,
                 )
                 .await
             {
@@ -117,7 +127,7 @@ impl RedisServer {
                 .set_str(
                     &format!("user:id:{}", user.id),
                     &serde_json::to_string(&user).unwrap(),
-                    REDIS_ENTITY_TIMEOUT_1_HOUR,
+                    REDIS_ENTITY_TIMEOUT,
                 )
                 .await
             {
@@ -134,7 +144,7 @@ impl RedisServer {
                 .set_str(
                     &format!("user_group:id:{}", group.id),
                     &serde_json::to_string(&group).unwrap(),
-                    REDIS_ENTITY_TIMEOUT_1_HOUR,
+                    REDIS_ENTITY_TIMEOUT,
                 )
                 .await
             {
@@ -145,7 +155,7 @@ impl RedisServer {
                 .set_str(
                     &format!("user_group:name:{}", group.name),
                     &serde_json::to_string(&group).unwrap(),
-                    REDIS_ENTITY_TIMEOUT_1_HOUR,
+                    REDIS_ENTITY_TIMEOUT,
                 )
                 .await
             {
@@ -156,32 +166,33 @@ impl RedisServer {
         Ok(())
     }
 
-    pub async fn acquire_lock(&self, id: &str) -> Result<String> {
-        let current_lock_holder = self.get_str("write_lock").await?;
+    pub async fn acquire_lock(&self, id: &str) -> Result<bool> {
+        let mut con = self.get_con().await?;
+        let result = con
+            .set_nx(WRITE_LOCK_KEY, id)
+            .await
+            .map_err(|e| RedisErrors::UnableToSet {
+                key: WRITE_LOCK_KEY.to_owned(),
+                source: anyhow!(e),
+            })?;
+        con.expire(WRITE_LOCK_KEY, REDIS_LOCK_TIMEOUT)
+            .await
+            .map_err(|e| RedisErrors::UnableToExpire {
+                key: WRITE_LOCK_KEY.to_owned(),
+                source: anyhow!(e),
+            })?;
+        trace!("SETNX `{:?}` => `{:?}` - RESULT: `{:?}`", WRITE_LOCK_KEY, id, result);
 
-        debug!("Current lock owner: {:?}", current_lock_holder);
-
-        match current_lock_holder {
-            RedisResult::String(s) => {
-                if s != id {
-                    return Ok(s);
-                } else {
-                    match self.set_str("write_lock", id, 120).await? {
-                        RedisResult::Nil => Ok(id.to_string()),
-                        RedisResult::String(s) => {
-                            self.set_str("write_lock", &s, 120).await?;
-                            Ok(s)
-                        }
-                    }
-                }
-            }
-            RedisResult::Nil => match self.set_str("write_lock", id, 120).await? {
-                RedisResult::Nil => Ok(id.to_string()),
-                RedisResult::String(s) => {
-                    self.set_str("write_lock", &s, 120).await?;
-                    Ok(s)
-                }
+        match u8::from_redis_value(&result) {
+            Err(e) => {
+                Err(RedisErrors::UnableToReadValue {
+                    key: WRITE_LOCK_KEY.to_owned(),
+                    source: anyhow!(e),
+                })
             },
+            Ok(value) => {
+                Ok(value == 1)
+            }
         }
     }
 
@@ -190,11 +201,17 @@ impl RedisServer {
         let result = con
             .getset(key, value)
             .await
-            .map_err(|e| RedisErrors::UnableToSet(format!("{}", e)))?;
+            .map_err(|e| RedisErrors::UnableToSet {
+                key: key.to_owned(),
+                source: anyhow!(e),
+            })?;
         if ttl_seconds > 0 {
             con.expire(key, ttl_seconds)
                 .await
-                .map_err(|e| RedisErrors::UnableToExpire(format!("{}", e)))?;
+                .map_err(|e| RedisErrors::UnableToExpire {
+                    key: key.to_owned(),
+                    source: anyhow!(e),
+                })?;
         }
         trace!("SET `{:?}` => `{:?}` - RESULT: `{:?}`", key, value, result);
 
@@ -203,8 +220,11 @@ impl RedisServer {
         }
 
         FromRedisValue::from_redis_value(&result)
-            .map_err(|e| RedisErrors::UnableToReadValue(format!("{}", e)))
-            .map(|s| RedisResult::String(s))
+            .map_err(|e| RedisErrors::UnableToReadValue {
+                key: key.to_owned(),
+                source: anyhow!(e),
+            })
+            .map(RedisResult::String)
     }
 
     async fn str_scan<T>(&self, pattern: &str) -> Result<Vec<T>>
@@ -215,7 +235,10 @@ impl RedisServer {
         let mut iter = con
             .scan_match(pattern)
             .await
-            .map_err(|e| RedisErrors::UnableToGet(format!("{}", e)))?;
+            .map_err(|e| RedisErrors::UnableToGet {
+                key: pattern.to_owned(),
+                source: anyhow!(e),
+            })?;
 
         trace!("SCAN `{}", pattern);
 
@@ -244,18 +267,19 @@ impl RedisServer {
         }
 
         let mut results: Vec<_> = Vec::new();
-        let values = con
-            .get(keys)
-            .await
-            .map_err(|e| RedisErrors::UnableToGet(format!("{}", e)))?;
+        let values = con.get(keys).await.map_err(|e| RedisErrors::UnableToGet {
+            key: pattern.to_owned(),
+            source: anyhow!(e),
+        })?;
 
         let values = match values {
             redis::Value::Bulk(v) => v,
             _ => {
                 warn!("Unable to fetch array");
-                return Err(RedisErrors::UnableToGet(format!(
-                    "Unable to fetch data from redis"
-                )));
+                return Err(RedisErrors::UnableToGet {
+                    key: pattern.to_owned(),
+                    source: anyhow!("fetch failed"),
+                });
             }
         };
 
@@ -288,10 +312,10 @@ impl RedisServer {
 
     async fn get_str(&self, key: &str) -> Result<RedisResult> {
         let mut con = self.get_con().await?;
-        let value = con
-            .get(key)
-            .await
-            .map_err(|e| RedisErrors::UnableToGet(format!("{}", e)))?;
+        let value = con.get(key).await.map_err(|e| RedisErrors::UnableToGet {
+            key: key.to_owned(),
+            source: anyhow!(e),
+        })?;
 
         trace!("GET `{:?}` - RESULT: `{:?}`", key, value);
 
@@ -300,14 +324,20 @@ impl RedisServer {
         }
 
         FromRedisValue::from_redis_value(&value)
-            .map_err(|e| RedisErrors::UnableToReadValue(format!("{}", e)))
-            .map(|s| RedisResult::String(s))
+            .map_err(|e| RedisErrors::UnableToReadValue {
+                key: key.to_owned(),
+                source: anyhow!(e),
+            })
+            .map(RedisResult::String)
     }
 
     async fn get_con(&self) -> Result<MobcCon> {
         self.redis_client
             .get()
             .await
-            .map_err(|e| RedisErrors::UnableToConnect(format!("{}", e)))
+            .map_err(|e| RedisErrors::UnableToConnect {
+                address: self.redis_address.clone(),
+                source: anyhow!(e),
+            })
     }
 }

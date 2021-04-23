@@ -1,31 +1,57 @@
-use error_enum::{ErrorContainer, ErrorEnum, PrettyError};
+use anyhow::Error as AnyhowError;
+use thiserror::Error;
 
-#[derive(Debug, PartialEq, Eq, ErrorContainer)]
+#[derive(Debug, Error)]
 pub enum CliErrors {
-    Redis(RedisErrors),
-    Slack(SlackErrors),
+    #[error(transparent)]
+    Redis(#[from] RedisErrors),
+
+    #[error(transparent)]
+    Slack(#[from] SlackErrors),
 }
 
-#[derive(Debug, PartialEq, Eq, ErrorEnum)]
-#[error_enum(prefix = "Slack")]
+#[derive(Debug, Error)]
 pub enum SlackErrors {
-    #[error_enum(description = "Unable to fetch from Slack")]
+    #[error("Unable to fetch from Slack")]
     UnableToFetch,
 }
 
-#[derive(Debug, PartialEq, Eq, ErrorEnum)]
-#[error_enum(prefix = "REDIS")]
+#[derive(Debug, Error)]
 pub enum RedisErrors {
-    #[error_enum(description = "Unable to connect to Redis")]
-    UnableToConnect(String),
-    #[error_enum(description = "Unable to write to redis")]
-    UnableToSet(String),
-    #[error_enum(description = "Unable to read from redis")]
-    UnableToGet(String),
-    #[error_enum(description = "Unable to set expire")]
-    UnableToExpire(String),
-    #[error_enum(description = "Unable to read value")]
-    UnableToReadValue(String),
-    #[error_enum(description = "Unable to deserialize")]
-    UnableToDeserialize(String),
+    #[error("Unable to connect to {address}")]
+    UnableToConnect {
+        address: String,
+        #[source]
+        source: AnyhowError,
+    },
+    #[error("Unable to write {key} to redis")]
+    UnableToSet {
+        key: String,
+        #[source]
+        source: AnyhowError,
+    },
+    #[error("Unable to read {key} from redis")]
+    UnableToGet {
+        key: String,
+        #[source]
+        source: AnyhowError,
+    },
+    #[error("Unable to set {key} to expire")]
+    UnableToExpire {
+        key: String,
+        #[source]
+        source: AnyhowError,
+    },
+    #[error("Unable to read {key} value")]
+    UnableToReadValue {
+        key: String,
+        #[source]
+        source: AnyhowError,
+    },
+    #[error("Unable to deserialize {input}")]
+    UnableToDeserialize {
+        input: String,
+        #[source]
+        source: AnyhowError,
+    },
 }

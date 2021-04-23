@@ -1,46 +1,41 @@
-use clap::Clap;
+use clap::{ArgGroup, Clap};
 use dotenv::dotenv;
-use log::error;
+use tracing::error;
 
 mod commands;
 mod error;
 mod libs;
 
 #[derive(Clap, Debug)]
+#[clap(group = ArgGroup::new("logging"))]
 pub struct LoggingOpts {
     /// A level of verbosity, and can be used multiple times
-    #[clap(short, long, parse(from_occurrences), group = "logging")]
-    verbose: u64,
+    #[clap(short, long, parse(from_occurrences), global(true), group = "logging")]
+    pub debug: u64,
 
-    /// Enable all logging
-    #[clap(short, long, group = "logging")]
-    debug: bool,
+    /// Enable warn logging
+    #[clap(short, long, global(true), group = "logging")]
+    pub warn: bool,
 
     /// Disable everything but error logging
-    #[clap(short, long, group = "logging")]
-    error: bool,
+    #[clap(short, long, global(true), group = "logging")]
+    pub error: bool,
 }
 
 impl LoggingOpts {
-    pub fn merge(right: &LoggingOpts, left: &LoggingOpts) -> LoggingOpts {
-        if right.debug || left.debug {
-            LoggingOpts {
-                debug: true,
-                error: false,
-                verbose: 0,
-            }
-        } else if right.verbose != 0 || left.verbose != 0 {
-            LoggingOpts {
-                verbose: std::cmp::max(right.verbose, left.verbose),
-                debug: false,
-                error: false,
-            }
+    pub fn to_level(&self) -> tracing::Level {
+        use tracing::Level;
+
+        if self.error {
+            Level::ERROR
+        } else if self.warn {
+            Level::WARN
+        } else if self.debug == 0 {
+            Level::INFO
+        } else if self.debug == 1 {
+            Level::DEBUG
         } else {
-            LoggingOpts {
-                debug: false,
-                error: right.error || left.error,
-                verbose: 0,
-            }
+            Level::TRACE
         }
     }
 }
@@ -64,9 +59,6 @@ enum SubCommand {
 
 #[derive(Clap, Debug)]
 pub struct UpdateRedisArgs {
-    #[clap(flatten)]
-    pub logging_opts: LoggingOpts,
-
     /// Unique ID to identify the server
     #[clap(long, env = "SERVER_ID")]
     pub server_id: String,
@@ -86,9 +78,6 @@ pub struct UpdateRedisArgs {
 
 #[derive(Clap, Debug)]
 pub struct WebArgs {
-    #[clap(flatten)]
-    pub logging_opts: LoggingOpts,
-
     /// Address of the Redis Server
     #[clap(long, default_value = "redis://127.0.0.1/", env = "REDIS_ADDRESS")]
     pub redis_address: String,
@@ -103,35 +92,27 @@ pub async fn main() {
     dotenv().ok();
 
     let opt = Opts::parse();
+    init_logger(&opt.logging_opts);
     let result = match opt.subcmd {
-        SubCommand::UpdateRedis(args) => {
-            crate::commands::redis_update(&opt.logging_opts, &args).await
-        }
-        SubCommand::Web(args) => crate::commands::web_server(&opt.logging_opts, &args).await,
+        SubCommand::UpdateRedis(args) => crate::commands::redis_update(&args).await,
+        SubCommand::Web(args) => crate::commands::web_server(&args).await,
     };
 
     if let Err(e) = result {
         error!("Error: {}", e);
-        std::process::exit(e.get_error_number().into());
+        std::process::exit(1);
     }
 }
 
-pub(crate) fn init_logger(logging_opts: &LoggingOpts) {
-    let mut logger = loggerv::Logger::new();
-    if logging_opts.debug {
-        logger = logger
-            .verbosity(10)
-            .line_numbers(true)
-            .add_module_path_filter(module_path!());
-    } else if logging_opts.error {
-        logger = logger.verbosity(0).add_module_path_filter(module_path!());
-    } else {
-        logger = logger
-            .base_level(log::Level::Info)
-            .verbosity(logging_opts.verbose)
-            .line_numbers(true)
-            .add_module_path_filter(module_path!());
-    }
+fn init_logger(logging_opts: &LoggingOpts) {
+    use tracing_subscriber::FmtSubscriber;
+    // a builder for `FmtSubscriber`.
+    let subscriber = FmtSubscriber::builder()
+        // all spans/events with a level higher than TRACE (e.g, debug, info, warn, etc.)
+        // will be written to stdout.
+        .with_max_level(logging_opts.to_level())
+        // completes the builder.
+        .finish();
 
-    logger.init().unwrap();
+    tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber failed");
 }

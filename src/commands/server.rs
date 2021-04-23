@@ -4,13 +4,13 @@ use serde_json::json;
 use warp::http::StatusCode;
 use warp::Filter;
 
-use log::{debug, info};
+use tracing::{debug, info};
 
 type Db = Arc<RedisServer>;
 
 use crate::error::CliErrors;
 use crate::libs::RedisServer;
-use crate::{init_logger, LoggingOpts, WebArgs};
+use crate::WebArgs;
 
 enum Response<T>
 where
@@ -58,10 +58,8 @@ where
     }
 }
 
-pub async fn web_server(root_logger: &LoggingOpts, args: &WebArgs) -> Result<(), CliErrors> {
+pub async fn web_server(args: &WebArgs) -> Result<(), CliErrors> {
     use std::net::SocketAddr;
-
-    init_logger(&LoggingOpts::merge(&root_logger, &args.logging_opts));
 
     let redis_server = match RedisServer::new(&args.redis_address).await {
         Ok(redis_server) => redis_server,
